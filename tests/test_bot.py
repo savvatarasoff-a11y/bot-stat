@@ -231,3 +231,44 @@ async def test_title_input_can_be_cancelled(env):
     assert session.texts(ADMIN)[-1] == "Отменено."
     await feed(msg(3, ADMIN, "просто текст"))
     assert await db.get_setting("stats") is None
+
+
+async def test_admin_edits_numbers(env):
+    feed, session, db = env["feed"], env["session"], env["db"]
+    for i, uid in enumerate((301, 302), start=1):
+        await feed(msg(i, uid, "/start"))
+    await feed(member(5, -100500, "supergroup", "member"))
+
+    await feed(button(10, ADMIN, "st:nums"))
+    assert "Изменение цифр" in session.edits(ADMIN)[-1].text
+    await feed(button(11, ADMIN, "st:num:users"))
+    await feed(msg(12, ADMIN, "abc"))
+    assert "Нужно число" in session.texts(ADMIN)[-1]
+    await feed(msg(13, ADMIN, "1500"))                    # ровно 1500
+    await feed(button(14, ADMIN, "st:num:groups"))
+    await feed(msg(15, ADMIN, "+100"))                    # 1 реальная + 100
+    await feed(button(16, ADMIN, "st:num:new_1"))
+    await feed(msg(17, ADMIN, "-50"))                     # не уходит ниже нуля
+    assert "реально 3, всегда 1500" in session.texts(ADMIN)[-1]
+
+    await feed(msg(20, ADMIN, "/stats"))
+    stats = session.texts(ADMIN)[-1]
+    assert "Пользователей: 1500 (доступны для рассылки: 3)" in stats
+    assert "Групп и каналов: 101 (активны: 1)" in stats
+    assert "Новых за сутки: 0, за неделю: 4" in stats
+
+    # поправка «+» следует за реальным значением
+    await feed(msg(21, 303, "/start"))
+    await feed(member(22, -100700, "group", "member"))
+    await feed(msg(23, ADMIN, "/stats"))
+    assert "Групп и каналов: 102" in session.texts(ADMIN)[-1]
+
+    await feed(button(30, ADMIN, "st:numdel:users"))
+    await feed(msg(31, ADMIN, "/stats"))
+    assert "Пользователей: 4 (" in session.texts(ADMIN)[-1]
+    await feed(button(32, ADMIN, "st:numclr"))
+    assert await db.get_setting("stats_overrides") is None
+
+    await feed(button(40, 777, "st:num:users"))           # не-админ не может
+    await feed(msg(41, 777, "999"))
+    assert await db.get_setting("stats_overrides") is None

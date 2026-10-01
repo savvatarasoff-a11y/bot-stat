@@ -11,6 +11,7 @@ from .broadcast import Broadcaster
 from .db import Database
 
 SETTINGS_KEY = "stats"
+OVERRIDES_KEY = "stats_overrides"
 DEFAULT_TITLE = "📊 Статистика бота"
 TITLE_MAX = 100
 
@@ -32,6 +33,17 @@ PERIODS = {1: "сутки", 7: "неделю", 30: "месяц"}
 SOURCES_LIMITS = (3, 5, 10, 20)
 HISTORY_LIMITS = (1, 3, 5, 10)
 TYPE_NAMES = {"private": "личные", "group": "группы", "supergroup": "супергруппы", "channel": "каналы"}
+# цифры, которые админ может поправить вручную: ключ -> название
+METRICS = {
+    "users": "👤 Пользователей",
+    "users_active": "👤 Доступны для рассылки",
+    "groups": "👥 Групп и каналов",
+    "groups_active": "👥 Активных групп",
+    "active": "📬 Получат рассылку",
+    **{f"new_{p}": f"🆕 Новых за {name}" for p, name in PERIODS.items()},
+    **{f"seen_{p}": f"🔥 Активны за {name}" for p, name in PERIODS.items()},
+}
+NUMBER_MAX = 10 ** 9
 STATUS_NAMES = {"running": "идёт", "done": "готово", "stopped": "остановлена"}
 
 
@@ -87,14 +99,69 @@ async def save_settings(db: Database, s: StatsSettings) -> None:
     await db.set_setting(SETTINGS_KEY, asdict(s))
 
 
-def _by_periods(counts: dict[int, dict], key: str, periods: list[int]) -> str:
-    return ", ".join(f"за {PERIODS[p]}: {counts[p][key]}" for p in periods)
+# ---------- ручные правки цифр ----------
+# правило: "=1500" — показывать ровно 1500, "+500" / "-20" — прибавить к реальному значению
+
+def parse_rule(text: str) -> str | None:
+    """Ввод админа -> правило или None, если это не число."""
+    t = text.strip().replace(" ", "")
+    sign = t[0] if t[:1] in ("+", "-", "=") else "="
+    digits = t[1:] if t[:1] in ("+", "-", "=") else t
+    if not digits.isdigit() or int(digits) > NUMBER_MAX:
+        return None
+    return f"{sign}{int(digits)}"
+
+
+def apply_rule(real: int, rule: str | None) -> int:
+    if not rule:
+        return real
+    n = int(rule[1:])
+    value = n if rule[0] == "=" else real + n if rule[0] == "+" else real - n
+    return max(value, 0)
+
+
+def describe_rule(rule: str) -> str:
+    return f"всегда {rule[1:]}" if rule[0] == "=" else f"{rule[0]}{rule[1:]} к реальному"
+
+
+async def load_overrides(db: Database) -> dict[str, str]:
+    raw = await db.get_setting(OVERRIDES_KEY, {})
+    if not isinstance(raw, dict):
+        return {}
+    return {k: v for k, v in raw.items() if k in METRICS and isinstance(v, str) and parse_rule(v) == v}
+
+
+async def save_overrides(db: Database, overrides: dict[str, str]) -> None:
+    if overrides:
+        await db.set_setting(OVERRIDES_KEY, overrides)
+    else:
+        await db.delete_setting(OVERRIDES_KEY)
+
+
+async def real_numbers(db: Database) -> dict[str, int]:
+    """Реальные значения всех METRICS."""
+    st = await db.stats()
+    nums = {k: st[k] for k in ("users", "users_active", "groups", "groups_active", "active")}
+    for p in PERIODS:
+        c = await db.counts_since(p)
+        nums[f"new_{p}"], nums[f"seen_{p}"] = c["new"], c["seen"]
+    return nums
+
+
+async def shown_numbers(db: Database) -> dict[str, int]:
+    """Значения с учётом правок админа."""
+    overrides = await load_overrides(db)
+    return {k: apply_rule(v, overrides.get(k)) for k, v in (await real_numbers(db)).items()}
+
+
+def _by_periods(st: dict[str, int], key: str, periods: list[int]) -> str:
+    return ", ".join(f"за {PERIODS[p]}: {st[f'{key}_{p}']}" for p in periods)
 
 
 async def stats_text(db: Database, broadcaster: Broadcaster, s: StatsSettings | None = None) -> str:
     s = s or await load_settings(db)
     on = set(s.sections)
-    st = await db.stats()
+    st = await shown_numbers(db)
     lines = [f"<b>{html.escape(s.title)}</b>\n"]
     if "users" in on:
         lines.append(f"👤 Пользователей: {st['users']} (доступны для рассылки: {st['users_active']})")
@@ -105,12 +172,10 @@ async def stats_text(db: Database, broadcaster: Broadcaster, s: StatsSettings | 
     if "types" in on:
         for r in await db.by_type():
             lines.append(f"   • {TYPE_NAMES.get(r['type'], r['type'])}: {r['n']} (активны: {r['active']})")
-    if s.periods and on & {"growth", "activity"}:
-        counts = {p: await db.counts_since(p) for p in s.periods}
-        if "growth" in on:
-            lines.append(f"🆕 Новых {_by_periods(counts, 'new', s.periods)}")
-        if "activity" in on:
-            lines.append(f"🔥 Активны {_by_periods(counts, 'seen', s.periods)}")
+    if s.periods and "growth" in on:
+        lines.append(f"🆕 Новых {_by_periods(st, 'new', s.periods)}")
+    if s.periods and "activity" in on:
+        lines.append(f"🔥 Активны {_by_periods(st, 'seen', s.periods)}")
     if "sources" in on:
         sources = await db.top_sources(s.sources_limit)
         if sources:
@@ -165,7 +230,37 @@ def settings_keyboard(s: StatsSettings) -> InlineKeyboardMarkup:
     ])
     rows.append([
         InlineKeyboardButton(text="✏️ Заголовок", callback_data="st:title"),
-        InlineKeyboardButton(text="♻️ По умолчанию", callback_data="st:reset"),
+        InlineKeyboardButton(text="🔢 Изменить цифры", callback_data="st:nums"),
     ])
+    rows.append([InlineKeyboardButton(text="♻️ По умолчанию", callback_data="st:reset")])
     rows.append([InlineKeyboardButton(text="📊 Показать статистику", callback_data="st:show")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def numbers_text(db: Database) -> str:
+    real, overrides = await real_numbers(db), await load_overrides(db)
+    lines = ["🔢 <b>Изменение цифр статистики</b>\n",
+             "Выберите показатель и пришлите число:",
+             "<code>1500</code> — показывать ровно 1500",
+             "<code>+500</code> / <code>-20</code> — прибавить или вычесть из реального значения\n"]
+    for k, name in METRICS.items():
+        rule = overrides.get(k)
+        line = f"{name}: <b>{apply_rule(real[k], rule)}</b>"
+        if rule:
+            line += f" (реально {real[k]}, {describe_rule(rule)})"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+async def numbers_keyboard(db: Database) -> InlineKeyboardMarkup:
+    overrides = await load_overrides(db)
+    keys = list(METRICS)
+    rows = [
+        [InlineKeyboardButton(text=("✏️ " if k in overrides else "") + METRICS[k], callback_data=f"st:num:{k}")
+         for k in keys[i:i + 2]]
+        for i in range(0, len(keys), 2)
+    ]
+    if overrides:
+        rows.append([InlineKeyboardButton(text="♻️ Вернуть реальные цифры", callback_data="st:numclr")])
+    rows.append([InlineKeyboardButton(text="« Назад к настройкам", callback_data="st:cfg")])
     return InlineKeyboardMarkup(inline_keyboard=rows)

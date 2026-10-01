@@ -14,8 +14,9 @@ from aiogram.types import (CallbackQuery, ChatMemberUpdated, InlineKeyboardButto
 from .broadcast import Broadcaster, Result, report
 from .config import Config
 from .db import Database
-from .stats import (HISTORY_LIMITS, PERIODS, SECTIONS, SOURCES_LIMITS, TITLE_MAX, StatsSettings,
-                    load_settings, next_value, save_settings, settings_keyboard, settings_text, stats_keyboard,
+from .stats import (HISTORY_LIMITS, METRICS, PERIODS, SECTIONS, SOURCES_LIMITS, TITLE_MAX, StatsSettings,
+                    describe_rule, load_overrides, load_settings, next_value, numbers_keyboard, numbers_text,
+                    parse_rule, save_overrides, save_settings, settings_keyboard, settings_text, stats_keyboard,
                     stats_text)
 
 
@@ -25,6 +26,7 @@ class BroadcastForm(StatesGroup):
 
 class StatsForm(StatesGroup):
     title = State()
+    number = State()
 
 
 def admin_keyboard() -> InlineKeyboardMarkup:
@@ -136,6 +138,45 @@ def build_router(cfg: Config, db: Database, broadcaster: Broadcaster) -> Router:
         await query.answer("Сохранено")
         await edit(query, settings_text(s), settings_keyboard(s))
 
+    @admin.callback_query(F.data == "st:nums")
+    async def numbers_menu(query: CallbackQuery, state: FSMContext) -> None:
+        await query.answer()
+        await state.clear()
+        await edit(query, await numbers_text(db), await numbers_keyboard(db))
+
+    @admin.callback_query(F.data.startswith("st:num:"))
+    async def number_ask(query: CallbackQuery, state: FSMContext) -> None:
+        key = query.data[7:]
+        if key not in METRICS:
+            await query.answer()
+            return
+        await query.answer()
+        await state.set_state(StatsForm.number)
+        await state.update_data(metric=key)
+        rule = (await load_overrides(db)).get(key)
+        now = f"\nСейчас: {describe_rule(rule)}." if rule else ""
+        buttons = [[InlineKeyboardButton(text="♻️ Вернуть реальное", callback_data=f"st:numdel:{key}")]] if rule else []
+        await query.message.answer(
+            f"✏️ <b>{METRICS[key]}</b>{now}\n\n"
+            "Пришлите <code>1500</code> (ровно столько), <code>+500</code> или <code>-20</code> "
+            "(поправка к реальному значению), либо /cancel",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None)
+
+    @admin.callback_query(F.data.startswith("st:numdel:") | (F.data == "st:numclr"))
+    async def number_reset(query: CallbackQuery, state: FSMContext) -> None:
+        await state.clear()
+        overrides = await load_overrides(db)
+        if query.data == "st:numclr":
+            overrides = {}
+        else:
+            overrides.pop(query.data[10:], None)
+        await save_overrides(db, overrides)
+        await query.answer("Реальные цифры возвращены")
+        if query.data == "st:numclr":
+            await edit(query, await numbers_text(db), await numbers_keyboard(db))
+        else:
+            await query.message.answer(await numbers_text(db), reply_markup=await numbers_keyboard(db))
+
     @admin.callback_query(F.data == "st:title")
     async def stats_title_ask(query: CallbackQuery, state: FSMContext) -> None:
         await query.answer()
@@ -184,6 +225,25 @@ def build_router(cfg: Config, db: Database, broadcaster: Broadcaster) -> Router:
         s.title = title[:TITLE_MAX]
         await save_settings(db, s)
         await message.answer(settings_text(s), reply_markup=settings_keyboard(s))
+
+    @admin.message(StateFilter(StatsForm.number), F.chat.type == "private")
+    async def number_set(message: Message, state: FSMContext) -> None:
+        rule = parse_rule(message.text or "")
+        if rule is None:
+            await message.answer("Нужно число: <code>1500</code>, <code>+500</code> или <code>-20</code>. "
+                                 "Или /cancel")
+            return
+        key = (await state.get_data()).get("metric")
+        await state.clear()
+        if key not in METRICS:
+            return
+        overrides = await load_overrides(db)
+        if rule in ("+0", "-0"):
+            overrides.pop(key, None)       # нулевая поправка = реальное значение
+        else:
+            overrides[key] = rule
+        await save_overrides(db, overrides)
+        await message.answer(await numbers_text(db), reply_markup=await numbers_keyboard(db))
 
     # ---------- все ----------
 
