@@ -363,6 +363,19 @@ async def test_report_follows_reach_override(env):
     assert "Всего получат рассылку: 15000" in stats and "доставлено 12000, не доставлено 3000" in stats
     assert (await db.one("SELECT sent, failed, queued FROM broadcasts")) == {"sent": 4, "failed": 1, "queued": 5}
 
+    # «Получат рассылку» = 12483 и «Не доставлено» = 5808: всего 12483, доставлено — остаток
+    await feed(button(40, ADMIN, "st:num:active"))
+    await feed(msg(41, ADMIN, "12483"))
+    await feed(button(42, ADMIN, "st:num:bc_failed"))
+    await feed(msg(43, ADMIN, "5808"))
+    await feed(msg(44, ADMIN, "/broadcast"))
+    await feed(msg(45, ADMIN, "ещё"))
+    await wait_done(bc)
+    report = session.texts(ADMIN)[-1]
+    assert "Успешно доставлено: 6675 пользователям" in report
+    assert "Не доставлено: 5808 пользователям" in report
+    assert "Всего обработано: 12483 пользователей" in report
+
 
 async def test_old_database_gets_queued_column(tmp_path):
     import sqlite3

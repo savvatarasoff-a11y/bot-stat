@@ -182,14 +182,24 @@ def shown_delivery(sent: int, failed: int, queued: int, overrides: dict[str, str
     """Доставлено / не доставлено / в очереди с учётом правок админа.
 
     Если поправлено «Получат рассылку», рассылка выглядит так, будто шла на столько чатов:
-    доставленные и недоставленные растут в той же пропорции. Поверх этого — поправки
-    «Доставлено / Не доставлено в рассылке»."""
+    доставленные и недоставленные растут в той же пропорции, а если одна из них задана
+    поправкой «Доставлено / Не доставлено в рассылке», вторая — остаток до этого числа."""
+    rule_sent, rule_failed = overrides.get("bc_sent"), overrides.get("bc_failed")
     target = apply_rule(queued, overrides.get("active")) if queued else 0
-    if queued and target != queued:
-        processed = round((sent + failed) * target / queued)
-        sent = round(sent * target / queued)
-        failed, queued = processed - sent, target
-    return apply_rule(sent, overrides.get("bc_sent")), apply_rule(failed, overrides.get("bc_failed")), queued
+    if not queued or target == queued:
+        return apply_rule(sent, rule_sent), apply_rule(failed, rule_failed), queued
+    processed = round((sent + failed) * target / queued)
+    sent = round(sent * target / queued)
+    failed = processed - sent
+    if rule_failed and not rule_sent:
+        failed = min(apply_rule(failed, rule_failed), processed)
+        sent = processed - failed
+    elif rule_sent and not rule_failed:
+        sent = min(apply_rule(sent, rule_sent), processed)
+        failed = processed - sent
+    else:
+        sent, failed = apply_rule(sent, rule_sent), apply_rule(failed, rule_failed)
+    return sent, failed, target
 
 
 async def progress_text(db: Database, res: Result) -> str:
