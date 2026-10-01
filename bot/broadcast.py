@@ -84,7 +84,10 @@ class Broadcaster:
                     await self.db.set_inactive(gone)
                     gone = []
                 if progress and i % PROGRESS_EVERY == 0 and i < len(ids):
-                    await progress(res)
+                    try:
+                        await progress(res)
+                    except Exception:      # не дошёл прогресс — рассылку не прерываем
+                        log.exception("Рассылка: не удалось отправить прогресс")
                 if self.delay:
                     await asyncio.sleep(self.delay)
         finally:
@@ -95,27 +98,24 @@ class Broadcaster:
               progress: Callable[[Result], Awaitable[None]] | None = None,
               done: Callable[[Result, bool], Awaitable[None]] | None = None) -> None:
         async def job() -> None:
+            self.result = Result()
             bc_id = await self.db.broadcast_begin(admin_id)
-            stopped = False
+            status = "done"
             try:
                 await self.run(bot, from_chat, message_id, progress)
             except asyncio.CancelledError:
-                stopped = True
-            res = self.result or Result()
-            await self.db.broadcast_end(bc_id, res.sent, res.failed, "stopped" if stopped else "done")
+                status = "stopped"
+            except Exception:              # отчёт по уже отправленным придёт всё равно
+                log.exception("Рассылка #%s прервана ошибкой", bc_id)
+                status = "error"
+            res = self.result
+            await self.db.broadcast_end(bc_id, res.sent, res.failed, status)
             log.info("Рассылка #%s: доставлено %s, не доставлено %s", bc_id, res.sent, res.failed)
             if done:
-                await done(res, stopped)
+                try:
+                    await done(res, status != "done")
+                except Exception:
+                    log.exception("Рассылка #%s: не удалось отправить отчёт", bc_id)
 
         self.task = asyncio.create_task(job())
 
-
-def report(res: Result, stopped: bool = False) -> str:
-    head = "⛔️ <b>Рассылка остановлена</b>" if stopped else "✅ <b>Рассылка завершена!</b>"
-    return (
-        f"{head}\n\n📊 <b>Статистика:</b>\n"
-        f"✅ Успешно доставлено: {res.sent} пользователям\n"
-        f"❌ Не доставлено: {res.failed} пользователям\n"
-        f"👥 Всего обработано: {res.total} пользователей"
-        + (f"\n\n🚫 Заблокировали бота или удалены: {res.gone} (больше не получат рассылку)" if res.gone else "")
-    )
