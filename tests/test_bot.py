@@ -291,6 +291,56 @@ async def test_admin_edits_numbers(env):
     assert await db.get_setting("stats_overrides") is None
 
 
+async def test_admin_configures_report_after_broadcast(env):
+    feed, session, db, bc = env["feed"], env["session"], env["db"], env["broadcaster"]
+    for i, uid in enumerate((301, 302, 303), start=1):
+        await feed(msg(i, uid, "/start"))
+    session.blocked = {302}
+
+    await feed(button(10, ADMIN, "st:rep"))
+    assert "Отчёт после рассылки" in session.edits(ADMIN)[-1].text
+    await feed(button(11, ADMIN, "st:rep:failed"))        # выключить «не доставлено»
+    await feed(button(12, ADMIN, "st:rep:stats"))         # добавить статистику бота
+    labels = [b.text for row in session.edits(ADMIN)[-1].reply_markup.inline_keyboard for b in row]
+    assert "▫️ ❌ Не доставлено" in labels and "✅ 📊 Статистика бота" in labels
+
+    await feed(button(13, ADMIN, "st:num:bc_sent"))       # поправка к доставленным
+    await feed(msg(14, ADMIN, "+1000"))
+    assert "Доставлено в рассылке: +1000 к реальному" in session.texts(ADMIN)[-1]
+    await feed(button(15, ADMIN, "st:num:users"))
+    await feed(msg(16, ADMIN, "=5000"))
+
+    await feed(msg(20, ADMIN, "/broadcast"))
+    await feed(msg(21, ADMIN, "привет"))
+    await wait_done(bc)
+    report = session.texts(ADMIN)[-1]
+    assert "Успешно доставлено: 1003 пользователям" in report     # 3 реально + 1000
+    assert "Не доставлено" not in report
+    assert "Всего обработано: 1004 пользователей" in report
+    assert "Заблокировали бота или удалены: 1" in report
+    assert "Статистика бота</b>" in report and "Пользователей: 5000" in report
+    assert "Сейчас идёт рассылка" not in report
+    assert "доставлено 1003, не доставлено 1 (готово)" in report  # в истории та же поправка
+
+    # в базе реальные цифры
+    assert (await db.one("SELECT sent, failed FROM broadcasts"))["sent"] == 3
+
+
+async def test_report_arrives_when_broadcast_breaks(env):
+    feed, session, db, bc = env["feed"], env["session"], env["db"], env["broadcaster"]
+    await feed(msg(1, 301, "/start"))
+
+    async def broken() -> list[int]:
+        raise RuntimeError("db is gone")
+    db.active_chat_ids = broken
+
+    await feed(msg(2, ADMIN, "/broadcast"))
+    await feed(msg(3, ADMIN, "привет"))
+    await wait_done(bc)
+    assert "Рассылка остановлена" in session.texts(ADMIN)[-1]
+    assert (await db.one("SELECT status FROM broadcasts"))["status"] == "error"
+
+
 def test_find_link():
     assert find_link("смотри https://vm.tiktok.com/ZMabc123/ !") == "https://vm.tiktok.com/ZMabc123/"
     assert find_link("https://www.tiktok.com/@user/video/7300000000000000000?lang=ru").endswith("?lang=ru")

@@ -12,13 +12,13 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (CallbackQuery, ChatMemberUpdated, FSInputFile, InlineKeyboardButton,
                            InlineKeyboardMarkup, Message)
 
-from .broadcast import Broadcaster, Result, report
+from .broadcast import Broadcaster, Result
 from .config import Config
 from .db import Database
-from .stats import (HISTORY_LIMITS, METRICS, PERIODS, SECTIONS, SOURCES_LIMITS, TITLE_MAX, StatsSettings,
-                    describe_rule, load_overrides, load_settings, next_value, numbers_keyboard, numbers_text,
-                    parse_rule, save_overrides, save_settings, settings_keyboard, settings_text, stats_keyboard,
-                    stats_text)
+from .stats import (ALL_METRICS, HISTORY_LIMITS, PERIODS, REPORT_LINES, SECTIONS, SOURCES_LIMITS, TITLE_MAX,
+                    StatsSettings, describe_rule, load_overrides, load_settings, next_value, numbers_keyboard,
+                    numbers_text, parse_rule, report_settings_keyboard, report_settings_text, report_text,
+                    save_overrides, save_settings, settings_keyboard, settings_text, stats_keyboard, stats_text)
 from .tiktok import DownloadError, TikTokDownloader, find_link
 
 
@@ -142,6 +142,20 @@ def build_router(cfg: Config, db: Database, broadcaster: Broadcaster,
         await query.answer("Сохранено")
         await edit(query, settings_text(s), settings_keyboard(s))
 
+    @admin.callback_query(F.data == "st:rep")
+    async def report_settings_btn(query: CallbackQuery) -> None:
+        await query.answer()
+        await edit(query, report_settings_text(), report_settings_keyboard(await load_settings(db)))
+
+    @admin.callback_query(F.data.startswith("st:rep:"))
+    async def report_settings_change(query: CallbackQuery) -> None:
+        s = await load_settings(db)
+        if query.data[7:] in REPORT_LINES:
+            s.toggle_report(query.data[7:])
+            await save_settings(db, s)
+        await query.answer("Сохранено")
+        await edit(query, report_settings_text(), report_settings_keyboard(s))
+
     @admin.callback_query(F.data == "st:nums")
     async def numbers_menu(query: CallbackQuery, state: FSMContext) -> None:
         await query.answer()
@@ -151,7 +165,7 @@ def build_router(cfg: Config, db: Database, broadcaster: Broadcaster,
     @admin.callback_query(F.data.startswith("st:num:"))
     async def number_ask(query: CallbackQuery, state: FSMContext) -> None:
         key = query.data[7:]
-        if key not in METRICS:
+        if key not in ALL_METRICS:
             await query.answer()
             return
         await query.answer()
@@ -161,7 +175,7 @@ def build_router(cfg: Config, db: Database, broadcaster: Broadcaster,
         now = f"\nСейчас: {describe_rule(rule)}." if rule else ""
         buttons = [[InlineKeyboardButton(text="♻️ Вернуть реальное", callback_data=f"st:numdel:{key}")]] if rule else []
         await query.message.answer(
-            f"✏️ <b>{METRICS[key]}</b>{now}\n\n"
+            f"✏️ <b>{ALL_METRICS[key]}</b>{now}\n\n"
             "Пришлите <code>1500</code> (ровно столько), <code>+500</code> или <code>-20</code> "
             "(поправка к реальному значению), либо /cancel",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None)
@@ -214,7 +228,7 @@ def build_router(cfg: Config, db: Database, broadcaster: Broadcaster,
             await bot.send_message(chat_id, f"📨 Обработано {res.total} из {res.queued}, доставлено {res.sent}")
 
         async def done(res: Result, stopped: bool) -> None:
-            await bot.send_message(chat_id, report(res, stopped))
+            await bot.send_message(chat_id, await report_text(db, broadcaster, res, stopped))
 
         broadcaster.start(bot, message.from_user.id, chat_id, message.message_id, progress, done)
 
@@ -239,7 +253,7 @@ def build_router(cfg: Config, db: Database, broadcaster: Broadcaster,
             return
         key = (await state.get_data()).get("metric")
         await state.clear()
-        if key not in METRICS:
+        if key not in ALL_METRICS:
             return
         overrides = await load_overrides(db)
         if rule in ("+0", "-0"):
