@@ -2,14 +2,15 @@
 from __future__ import annotations
 
 import html
+import logging
 
 from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import (CallbackQuery, ChatMemberUpdated, InlineKeyboardButton, InlineKeyboardMarkup,
-                           Message)
+from aiogram.types import (CallbackQuery, ChatMemberUpdated, FSInputFile, InlineKeyboardButton,
+                           InlineKeyboardMarkup, Message)
 
 from .broadcast import Broadcaster, Result, report
 from .config import Config
@@ -18,6 +19,7 @@ from .stats import (HISTORY_LIMITS, METRICS, PERIODS, SECTIONS, SOURCES_LIMITS, 
                     describe_rule, load_overrides, load_settings, next_value, numbers_keyboard, numbers_text,
                     parse_rule, save_overrides, save_settings, settings_keyboard, settings_text, stats_keyboard,
                     stats_text)
+from .tiktok import DownloadError, TikTokDownloader, find_link
 
 
 class BroadcastForm(StatesGroup):
@@ -52,7 +54,9 @@ async def edit(query: CallbackQuery, text: str, markup: InlineKeyboardMarkup) ->
             raise
 
 
-def build_router(cfg: Config, db: Database, broadcaster: Broadcaster) -> Router:
+def build_router(cfg: Config, db: Database, broadcaster: Broadcaster,
+                 downloader: TikTokDownloader | None = None) -> Router:
+    downloader = downloader or TikTokDownloader()
     root = Router(name="root")
     admin = Router(name="admin")
     admin.message.filter(F.from_user.id.in_(cfg.admin_ids))
@@ -257,7 +261,32 @@ def build_router(cfg: Config, db: Database, broadcaster: Broadcaster) -> Router:
 
     @users.message(CommandStart(), F.chat.type == "private")
     async def start(message: Message) -> None:
-        await message.answer(f"👋 Привет, {html.escape(message.from_user.first_name)}!")
+        await message.answer(f"👋 Привет, {html.escape(message.from_user.first_name)}!\n\n"
+                             "Пришлите ссылку на видео из TikTok, и я скачаю его для вас.")
+
+    @users.message(F.text.func(find_link))
+    async def tiktok(message: Message, bot: Bot) -> None:
+        url = find_link(message.text)
+        wait = await message.reply("⏳ Скачиваю видео...")
+        await bot.send_chat_action(message.chat.id, "upload_video")
+        try:
+            video = await downloader.download(url)
+        except DownloadError as e:
+            await wait.edit_text(f"❌ {e}")
+            return
+        except Exception:
+            logging.getLogger(__name__).exception("TikTok: ошибка %s", url)
+            await wait.edit_text("❌ Не удалось скачать видео, попробуйте позже.")
+            return
+        try:
+            await message.reply_video(FSInputFile(video.path), width=video.width, height=video.height,
+                                      duration=video.duration, supports_streaming=True)
+            await wait.delete()
+        except Exception:
+            logging.getLogger(__name__).exception("TikTok: не отправилось %s", url)
+            await wait.edit_text("❌ Не удалось отправить видео, попробуйте позже.")
+        finally:
+            video.cleanup()
 
     @users.my_chat_member()
     async def membership(event: ChatMemberUpdated) -> None:

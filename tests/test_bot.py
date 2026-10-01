@@ -11,13 +11,14 @@ from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.base import BaseSession
 from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
-from aiogram.methods import CopyMessage, EditMessageText, SendMessage, TelegramMethod
+from aiogram.methods import CopyMessage, EditMessageText, SendMessage, SendVideo, TelegramMethod
 from aiogram.types import Update
 
 from bot.broadcast import Broadcaster
 from bot.config import Config
 from bot.db import Database
 from bot.handlers import build_router
+from bot.tiktok import DownloadError, Video, find_link
 
 ADMIN = 5349009098
 
@@ -38,7 +39,7 @@ class FakeSession(BaseSession):
                 self.flood_once.discard(method.chat_id)
                 raise TelegramRetryAfter(method=method, message="Too Many Requests", retry_after=0)
             raw: Any = {"message_id": 5}
-        elif isinstance(method, SendMessage):
+        elif isinstance(method, (SendMessage, SendVideo)):
             raw = {"message_id": 1, "date": int(time.time()), "chat": {"id": method.chat_id, "type": "private"},
                    "text": method.text}
         else:
@@ -88,6 +89,21 @@ def member(uid: int, chat_id: int, chat_type: str, status: str) -> dict:
                             else {"status": status, "user": bot_user})}}
 
 
+class FakeDownloader:
+    def __init__(self, tmp_path) -> None:
+        self.tmp = tmp_path
+        self.urls: list[str] = []
+
+    async def download(self, url: str) -> Video:
+        self.urls.append(url)
+        if "private" in url:
+            raise DownloadError("Не удалось скачать видео. Проверьте ссылку: видео должно быть открытым.")
+        folder = self.tmp / f"v{len(self.urls)}"
+        folder.mkdir()
+        (folder / "video.mp4").write_bytes(b"mp4")
+        return Video(path=str(folder / "video.mp4"), title="t", width=720, height=1280, duration=9)
+
+
 @pytest.fixture
 async def env(tmp_path):
     cfg = Config(bot_token="1:x", admin_ids=frozenset({ADMIN}), db_path=str(tmp_path / "b.db"), broadcast_rate=0)
@@ -97,12 +113,13 @@ async def env(tmp_path):
     bot = Bot("1:x", session=session, default=DefaultBotProperties(parse_mode="HTML"))
     broadcaster = Broadcaster(db, cfg.broadcast_rate)
     dp = Dispatcher()
-    dp.include_router(build_router(cfg, db, broadcaster))
+    downloader = FakeDownloader(tmp_path)
+    dp.include_router(build_router(cfg, db, broadcaster, downloader))
 
     async def feed(raw: dict) -> None:
         await dp.feed_update(bot, Update.model_validate(raw, context={"bot": bot}))
 
-    yield {"feed": feed, "session": session, "db": db, "broadcaster": broadcaster}
+    yield {"feed": feed, "session": session, "db": db, "broadcaster": broadcaster, "downloader": downloader}
     broadcaster.stop()
     await db.close()
 
@@ -272,3 +289,30 @@ async def test_admin_edits_numbers(env):
     await feed(button(40, 777, "st:num:users"))           # не-админ не может
     await feed(msg(41, 777, "999"))
     assert await db.get_setting("stats_overrides") is None
+
+
+def test_find_link():
+    assert find_link("смотри https://vm.tiktok.com/ZMabc123/ !") == "https://vm.tiktok.com/ZMabc123/"
+    assert find_link("https://www.tiktok.com/@user/video/7300000000000000000?lang=ru").endswith("?lang=ru")
+    assert find_link("https://youtube.com/watch?v=1") is None and find_link(None) is None
+
+
+async def test_tiktok_download(env):
+    feed, session, db, dl = env["feed"], env["session"], env["db"], env["downloader"]
+    await feed(msg(1, 501, "/start"))
+    assert "TikTok" in session.texts(501)[-1]
+    assert not any("статистик" in t.lower() for t in session.texts(501))   # про статистику ни слова
+
+    await feed(msg(2, 501, "вот https://vm.tiktok.com/ZMabc123/"))
+    videos = [c for c in session.calls if isinstance(c, SendVideo)]
+    assert dl.urls == ["https://vm.tiktok.com/ZMabc123/"] and len(videos) == 1
+    assert videos[0].chat_id == 501 and videos[0].height == 1280
+    assert not (dl.tmp / "v1").exists()                                   # временный файл удалён
+
+    await feed(msg(3, 501, "https://www.tiktok.com/@a/video/private"))
+    assert any("Не удалось скачать" in e.text for e in session.edits(501))
+
+    await feed(msg(4, 501, "просто текст"))
+    assert len(dl.urls) == 2
+    # пользователь попал в базу и получит рассылку
+    assert (await db.one("SELECT active FROM chats WHERE id=501"))["active"] == 1
