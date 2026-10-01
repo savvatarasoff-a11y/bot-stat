@@ -2,28 +2,40 @@
 from __future__ import annotations
 
 import html
-import time
+import logging
 
 from aiogram import Bot, F, Router
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import (CallbackQuery, ChatMemberUpdated, InlineKeyboardButton, InlineKeyboardMarkup,
-                           Message)
+from aiogram.types import (CallbackQuery, ChatMemberUpdated, FSInputFile, InlineKeyboardButton,
+                           InlineKeyboardMarkup, Message)
 
 from .broadcast import Broadcaster, Result, report
 from .config import Config
 from .db import Database
+from .stats import (HISTORY_LIMITS, METRICS, PERIODS, SECTIONS, SOURCES_LIMITS, TITLE_MAX, StatsSettings,
+                    describe_rule, load_overrides, load_settings, next_value, numbers_keyboard, numbers_text,
+                    parse_rule, save_overrides, save_settings, settings_keyboard, settings_text, stats_keyboard,
+                    stats_text)
+from .tiktok import DownloadError, TikTokDownloader, find_link
 
 
 class BroadcastForm(StatesGroup):
     message = State()
 
 
+class StatsForm(StatesGroup):
+    title = State()
+    number = State()
+
+
 def admin_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📨 Рассылка", callback_data="adm:broadcast")],
         [InlineKeyboardButton(text="📊 Статистика", callback_data="adm:stats")],
+        [InlineKeyboardButton(text="⚙️ Настройка статистики", callback_data="st:cfg")],
     ])
 
 
@@ -33,34 +45,18 @@ def chat_title(chat) -> str | None:
     return chat.title
 
 
-async def stats_text(db: Database, broadcaster: Broadcaster) -> str:
-    s = await db.stats()
-    lines = [
-        "📊 <b>Статистика бота</b>\n",
-        f"👤 Пользователей: {s['users']} (доступны для рассылки: {s['users_active']})",
-        f"👥 Групп и каналов: {s['groups']} (активны: {s['groups_active']})",
-        f"📬 Всего получат рассылку: {s['active']}",
-        f"🆕 Новых за сутки: {s['day']}, за неделю: {s['week']}",
-        f"🔥 Активны за сутки: {s['seen_day']}",
-    ]
-    sources = await db.top_sources(5)
-    if sources:
-        lines.append("\n🔗 <b>Источники</b> (параметр /start):")
-        lines += [f"<code>{html.escape(r['start_arg'])}</code> — {r['n']}" for r in sources]
-    history = await db.last_broadcasts(3)
-    if history:
-        lines.append("\n📨 <b>Последние рассылки:</b>")
-        for b in history:
-            when = time.strftime("%d.%m %H:%M", time.localtime(b["started_at"]))
-            status = {"running": "идёт", "done": "готово", "stopped": "остановлена"}[b["status"]]
-            lines.append(f"{when} — доставлено {b['sent']}, не доставлено {b['failed']} ({status})")
-    if broadcaster.running and broadcaster.result:
-        r = broadcaster.result
-        lines.append(f"\n⏳ Сейчас идёт рассылка: {r.total} из {r.queued}")
-    return "\n".join(lines)
+async def edit(query: CallbackQuery, text: str, markup: InlineKeyboardMarkup) -> None:
+    """Перерисовать сообщение с кнопками; «не изменилось» — не ошибка."""
+    try:
+        await query.message.edit_text(text, reply_markup=markup)
+    except TelegramBadRequest as e:
+        if "not modified" not in e.message:
+            raise
 
 
-def build_router(cfg: Config, db: Database, broadcaster: Broadcaster) -> Router:
+def build_router(cfg: Config, db: Database, broadcaster: Broadcaster,
+                 downloader: TikTokDownloader | None = None) -> Router:
+    downloader = downloader or TikTokDownloader()
     root = Router(name="root")
     admin = Router(name="admin")
     admin.message.filter(F.from_user.id.in_(cfg.admin_ids))
@@ -86,6 +82,7 @@ def build_router(cfg: Config, db: Database, broadcaster: Broadcaster) -> Router:
             "/broadcast — рассылка по всем чатам бота\n"
             "/stop — остановить текущую рассылку\n"
             "/stats — статистика\n"
+            "/stats_settings — что показывать в статистике\n"
             "/cancel — отменить ввод",
             reply_markup=admin_keyboard())
 
@@ -100,12 +97,95 @@ def build_router(cfg: Config, db: Database, broadcaster: Broadcaster) -> Router:
 
     @admin.message(Command("stats"))
     async def stats_cmd(message: Message) -> None:
-        await message.answer(await stats_text(db, broadcaster))
+        await message.answer(await stats_text(db, broadcaster), reply_markup=stats_keyboard())
 
     @admin.callback_query(F.data == "adm:stats")
     async def stats_btn(query: CallbackQuery) -> None:
         await query.answer()
-        await query.message.answer(await stats_text(db, broadcaster))
+        await query.message.answer(await stats_text(db, broadcaster), reply_markup=stats_keyboard())
+
+    @admin.callback_query(F.data == "st:show")
+    async def stats_refresh(query: CallbackQuery) -> None:
+        await query.answer()
+        await edit(query, await stats_text(db, broadcaster), stats_keyboard())
+
+    # ---------- настройка статистики ----------
+
+    @admin.message(Command("stats_settings"))
+    async def stats_settings_cmd(message: Message, state: FSMContext) -> None:
+        await state.clear()
+        s = await load_settings(db)
+        await message.answer(settings_text(s), reply_markup=settings_keyboard(s))
+
+    @admin.callback_query(F.data == "st:cfg")
+    async def stats_settings_btn(query: CallbackQuery) -> None:
+        await query.answer()
+        s = await load_settings(db)
+        await edit(query, settings_text(s), settings_keyboard(s))
+
+    @admin.callback_query(F.data.startswith("st:sec:") | F.data.startswith("st:per:")
+                          | F.data.in_({"st:src", "st:hist", "st:reset"}))
+    async def stats_settings_change(query: CallbackQuery) -> None:
+        s = await load_settings(db)
+        data = query.data
+        if data.startswith("st:sec:") and data[7:] in SECTIONS:
+            s.toggle_section(data[7:])
+        elif data.startswith("st:per:") and data[7:].isdigit() and int(data[7:]) in PERIODS:
+            s.toggle_period(int(data[7:]))
+        elif data == "st:src":
+            s.sources_limit = next_value(SOURCES_LIMITS, s.sources_limit)
+        elif data == "st:hist":
+            s.history_limit = next_value(HISTORY_LIMITS, s.history_limit)
+        elif data == "st:reset":
+            s = StatsSettings()
+        await save_settings(db, s)
+        await query.answer("Сохранено")
+        await edit(query, settings_text(s), settings_keyboard(s))
+
+    @admin.callback_query(F.data == "st:nums")
+    async def numbers_menu(query: CallbackQuery, state: FSMContext) -> None:
+        await query.answer()
+        await state.clear()
+        await edit(query, await numbers_text(db), await numbers_keyboard(db))
+
+    @admin.callback_query(F.data.startswith("st:num:"))
+    async def number_ask(query: CallbackQuery, state: FSMContext) -> None:
+        key = query.data[7:]
+        if key not in METRICS:
+            await query.answer()
+            return
+        await query.answer()
+        await state.set_state(StatsForm.number)
+        await state.update_data(metric=key)
+        rule = (await load_overrides(db)).get(key)
+        now = f"\nСейчас: {describe_rule(rule)}." if rule else ""
+        buttons = [[InlineKeyboardButton(text="♻️ Вернуть реальное", callback_data=f"st:numdel:{key}")]] if rule else []
+        await query.message.answer(
+            f"✏️ <b>{METRICS[key]}</b>{now}\n\n"
+            "Пришлите <code>1500</code> (ровно столько), <code>+500</code> или <code>-20</code> "
+            "(поправка к реальному значению), либо /cancel",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None)
+
+    @admin.callback_query(F.data.startswith("st:numdel:") | (F.data == "st:numclr"))
+    async def number_reset(query: CallbackQuery, state: FSMContext) -> None:
+        await state.clear()
+        overrides = await load_overrides(db)
+        if query.data == "st:numclr":
+            overrides = {}
+        else:
+            overrides.pop(query.data[10:], None)
+        await save_overrides(db, overrides)
+        await query.answer("Реальные цифры возвращены")
+        if query.data == "st:numclr":
+            await edit(query, await numbers_text(db), await numbers_keyboard(db))
+        else:
+            await query.message.answer(await numbers_text(db), reply_markup=await numbers_keyboard(db))
+
+    @admin.callback_query(F.data == "st:title")
+    async def stats_title_ask(query: CallbackQuery, state: FSMContext) -> None:
+        await query.answer()
+        await state.set_state(StatsForm.title)
+        await query.message.answer(f"✏️ Пришлите новый заголовок статистики (до {TITLE_MAX} символов) или /cancel")
 
     @admin.message(Command("cancel"))
     async def cancel(message: Message, state: FSMContext) -> None:
@@ -138,6 +218,37 @@ def build_router(cfg: Config, db: Database, broadcaster: Broadcaster) -> Router:
 
         broadcaster.start(bot, message.from_user.id, chat_id, message.message_id, progress, done)
 
+    @admin.message(StateFilter(StatsForm.title), F.chat.type == "private")
+    async def stats_title_set(message: Message, state: FSMContext) -> None:
+        title = (message.text or "").strip()
+        if not title or title.startswith("/"):
+            await message.answer("Пришлите заголовок текстом или /cancel")
+            return
+        await state.clear()
+        s = await load_settings(db)
+        s.title = title[:TITLE_MAX]
+        await save_settings(db, s)
+        await message.answer(settings_text(s), reply_markup=settings_keyboard(s))
+
+    @admin.message(StateFilter(StatsForm.number), F.chat.type == "private")
+    async def number_set(message: Message, state: FSMContext) -> None:
+        rule = parse_rule(message.text or "")
+        if rule is None:
+            await message.answer("Нужно число: <code>1500</code>, <code>+500</code> или <code>-20</code>. "
+                                 "Или /cancel")
+            return
+        key = (await state.get_data()).get("metric")
+        await state.clear()
+        if key not in METRICS:
+            return
+        overrides = await load_overrides(db)
+        if rule in ("+0", "-0"):
+            overrides.pop(key, None)       # нулевая поправка = реальное значение
+        else:
+            overrides[key] = rule
+        await save_overrides(db, overrides)
+        await message.answer(await numbers_text(db), reply_markup=await numbers_keyboard(db))
+
     # ---------- все ----------
 
     @root.message.outer_middleware()
@@ -150,7 +261,32 @@ def build_router(cfg: Config, db: Database, broadcaster: Broadcaster) -> Router:
 
     @users.message(CommandStart(), F.chat.type == "private")
     async def start(message: Message) -> None:
-        await message.answer(f"👋 Привет, {html.escape(message.from_user.first_name)}!")
+        await message.answer(f"👋 Привет, {html.escape(message.from_user.first_name)}!\n\n"
+                             "Пришлите ссылку на видео из TikTok, и я скачаю его для вас.")
+
+    @users.message(F.text.func(find_link))
+    async def tiktok(message: Message, bot: Bot) -> None:
+        url = find_link(message.text)
+        wait = await message.reply("⏳ Скачиваю видео...")
+        await bot.send_chat_action(message.chat.id, "upload_video")
+        try:
+            video = await downloader.download(url)
+        except DownloadError as e:
+            await wait.edit_text(f"❌ {e}")
+            return
+        except Exception:
+            logging.getLogger(__name__).exception("TikTok: ошибка %s", url)
+            await wait.edit_text("❌ Не удалось скачать видео, попробуйте позже.")
+            return
+        try:
+            await message.reply_video(FSInputFile(video.path), width=video.width, height=video.height,
+                                      duration=video.duration, supports_streaming=True)
+            await wait.delete()
+        except Exception:
+            logging.getLogger(__name__).exception("TikTok: не отправилось %s", url)
+            await wait.edit_text("❌ Не удалось отправить видео, попробуйте позже.")
+        finally:
+            video.cleanup()
 
     @users.my_chat_member()
     async def membership(event: ChatMemberUpdated) -> None:

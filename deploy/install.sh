@@ -20,6 +20,8 @@ fi
 python3 -m venv "$DIR/.venv"
 "$DIR/.venv/bin/pip" install -q --upgrade pip
 "$DIR/.venv/bin/pip" install -q -r "$DIR/requirements.txt"
+# TikTok часто меняет сайт: при каждом обновлении берём свежий yt-dlp
+"$DIR/.venv/bin/pip" install -q --upgrade "yt-dlp[default,curl-cffi]"
 
 if [ -n "$TOKEN" ]; then
     echo "BOT_TOKEN=$TOKEN" > "$DIR/.env"

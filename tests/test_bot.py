@@ -11,13 +11,14 @@ from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.base import BaseSession
 from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
-from aiogram.methods import CopyMessage, SendMessage, TelegramMethod
+from aiogram.methods import CopyMessage, EditMessageText, SendMessage, SendVideo, TelegramMethod
 from aiogram.types import Update
 
 from bot.broadcast import Broadcaster
 from bot.config import Config
 from bot.db import Database
 from bot.handlers import build_router
+from bot.tiktok import DownloadError, Video, find_link
 
 ADMIN = 5349009098
 
@@ -38,7 +39,7 @@ class FakeSession(BaseSession):
                 self.flood_once.discard(method.chat_id)
                 raise TelegramRetryAfter(method=method, message="Too Many Requests", retry_after=0)
             raw: Any = {"message_id": 5}
-        elif isinstance(method, SendMessage):
+        elif isinstance(method, (SendMessage, SendVideo)):
             raw = {"message_id": 1, "date": int(time.time()), "chat": {"id": method.chat_id, "type": "private"},
                    "text": method.text}
         else:
@@ -54,6 +55,9 @@ class FakeSession(BaseSession):
     def texts(self, chat_id: int) -> list[str]:
         return [c.text for c in self.calls if isinstance(c, SendMessage) and c.chat_id == chat_id]
 
+    def edits(self, chat_id: int) -> list[EditMessageText]:
+        return [c for c in self.calls if isinstance(c, EditMessageText) and c.chat_id == chat_id]
+
     def copies(self) -> list[int]:
         return [c.chat_id for c in self.calls if isinstance(c, CopyMessage)]
 
@@ -68,6 +72,13 @@ def msg(uid: int, chat_id: int, text: str, chat_type: str = "private", from_id: 
     return {"update_id": uid, "message": m}
 
 
+def button(uid: int, user_id: int, data: str) -> dict:
+    message = {"message_id": 1, "date": int(time.time()), "chat": {"id": user_id, "type": "private"}, "text": "x"}
+    return {"update_id": uid, "callback_query": {
+        "id": str(uid), "chat_instance": "1", "data": data, "message": message,
+        "from": {"id": user_id, "is_bot": False, "first_name": "U"}}}
+
+
 def member(uid: int, chat_id: int, chat_type: str, status: str) -> dict:
     bot_user = {"id": 1, "is_bot": True, "first_name": "Bot"}
     chat = {"id": chat_id, "type": chat_type, "title": "Group"}
@@ -76,6 +87,21 @@ def member(uid: int, chat_id: int, chat_type: str, status: str) -> dict:
         "old_chat_member": {"status": "left", "user": bot_user},
         "new_chat_member": ({"status": "kicked", "user": bot_user, "until_date": 0} if status == "kicked"
                             else {"status": status, "user": bot_user})}}
+
+
+class FakeDownloader:
+    def __init__(self, tmp_path) -> None:
+        self.tmp = tmp_path
+        self.urls: list[str] = []
+
+    async def download(self, url: str) -> Video:
+        self.urls.append(url)
+        if "private" in url:
+            raise DownloadError("Не удалось скачать видео. Проверьте ссылку: видео должно быть открытым.")
+        folder = self.tmp / f"v{len(self.urls)}"
+        folder.mkdir()
+        (folder / "video.mp4").write_bytes(b"mp4")
+        return Video(path=str(folder / "video.mp4"), title="t", width=720, height=1280, duration=9)
 
 
 @pytest.fixture
@@ -87,12 +113,13 @@ async def env(tmp_path):
     bot = Bot("1:x", session=session, default=DefaultBotProperties(parse_mode="HTML"))
     broadcaster = Broadcaster(db, cfg.broadcast_rate)
     dp = Dispatcher()
-    dp.include_router(build_router(cfg, db, broadcaster))
+    downloader = FakeDownloader(tmp_path)
+    dp.include_router(build_router(cfg, db, broadcaster, downloader))
 
     async def feed(raw: dict) -> None:
         await dp.feed_update(bot, Update.model_validate(raw, context={"bot": bot}))
 
-    yield {"feed": feed, "session": session, "db": db, "broadcaster": broadcaster}
+    yield {"feed": feed, "session": session, "db": db, "broadcaster": broadcaster, "downloader": downloader}
     broadcaster.stop()
     await db.close()
 
@@ -171,3 +198,121 @@ async def test_cancel_and_stop(env):
     await wait_done(bc)
     assert "Рассылка остановлена" in session.texts(ADMIN)[-1]
     assert len(session.copies()) < 51
+
+
+async def test_admin_configures_stats(env):
+    feed, session, db = env["feed"], env["session"], env["db"]
+    for i, uid in enumerate((301, 302), start=1):
+        await feed(msg(i, uid, f"/start ref{uid}"))
+    await feed(member(5, -100500, "supergroup", "member"))
+
+    await feed(msg(10, ADMIN, "/stats_settings"))
+    assert "Настройка статистики" in session.texts(ADMIN)[-1]
+    await feed(button(11, ADMIN, "st:sec:users"))        # выключить пользователей
+    await feed(button(12, ADMIN, "st:sec:types"))        # включить разбивку по типам
+    await feed(button(13, ADMIN, "st:per:30"))           # добавить период «месяц»
+    await feed(button(14, ADMIN, "st:src"))              # 5 -> 10 источников
+    kb = session.edits(ADMIN)[-1].reply_markup.inline_keyboard
+    labels = [b.text for row in kb for b in row]
+    assert "▫️ 👤 Пользователи" in labels and "✅ 🧩 По типам чатов" in labels
+    assert "✅ за месяц" in labels and "🔗 Источников: 10" in labels
+
+    await feed(button(15, ADMIN, "st:title"))
+    await feed(msg(16, ADMIN, "Мой <отчёт>"))
+    assert "Мой &lt;отчёт&gt;" in session.texts(ADMIN)[-1]
+
+    await feed(msg(20, ADMIN, "/stats"))
+    stats = session.texts(ADMIN)[-1]
+    assert stats.startswith("<b>Мой &lt;отчёт&gt;</b>")
+    assert "Пользователей" not in stats
+    assert "личные: 3 (активны: 3)" in stats and "супергруппы: 1 (активны: 1)" in stats
+    assert "Новых за сутки: 4, за неделю: 4, за месяц: 4" in stats
+    assert "<code>ref301</code> — 1" in stats
+
+    # настройки в базе переживают перезапуск; сброс возвращает умолчания
+    assert (await db.get_setting("stats"))["sources_limit"] == 10
+    await feed(button(21, ADMIN, "st:reset"))
+    await feed(msg(22, ADMIN, "/stats"))
+    stats = session.texts(ADMIN)[-1]
+    assert "Пользователей: 3" in stats and "за месяц" not in stats and "Статистика бота" in stats
+
+    # не-админ не может менять настройки
+    await feed(button(30, 777, "st:sec:users"))
+    assert "users" in (await db.get_setting("stats"))["sections"]
+
+
+async def test_title_input_can_be_cancelled(env):
+    feed, session, db = env["feed"], env["session"], env["db"]
+    await feed(button(1, ADMIN, "st:title"))
+    await feed(msg(2, ADMIN, "/cancel"))
+    assert session.texts(ADMIN)[-1] == "Отменено."
+    await feed(msg(3, ADMIN, "просто текст"))
+    assert await db.get_setting("stats") is None
+
+
+async def test_admin_edits_numbers(env):
+    feed, session, db = env["feed"], env["session"], env["db"]
+    for i, uid in enumerate((301, 302), start=1):
+        await feed(msg(i, uid, "/start"))
+    await feed(member(5, -100500, "supergroup", "member"))
+
+    await feed(button(10, ADMIN, "st:nums"))
+    assert "Изменение цифр" in session.edits(ADMIN)[-1].text
+    await feed(button(11, ADMIN, "st:num:users"))
+    await feed(msg(12, ADMIN, "abc"))
+    assert "Нужно число" in session.texts(ADMIN)[-1]
+    await feed(msg(13, ADMIN, "1500"))                    # ровно 1500
+    await feed(button(14, ADMIN, "st:num:groups"))
+    await feed(msg(15, ADMIN, "+100"))                    # 1 реальная + 100
+    await feed(button(16, ADMIN, "st:num:new_1"))
+    await feed(msg(17, ADMIN, "-50"))                     # не уходит ниже нуля
+    assert "реально 3, всегда 1500" in session.texts(ADMIN)[-1]
+
+    await feed(msg(20, ADMIN, "/stats"))
+    stats = session.texts(ADMIN)[-1]
+    assert "Пользователей: 1500 (доступны для рассылки: 3)" in stats
+    assert "Групп и каналов: 101 (активны: 1)" in stats
+    assert "Новых за сутки: 0, за неделю: 4" in stats
+
+    # поправка «+» следует за реальным значением
+    await feed(msg(21, 303, "/start"))
+    await feed(member(22, -100700, "group", "member"))
+    await feed(msg(23, ADMIN, "/stats"))
+    assert "Групп и каналов: 102" in session.texts(ADMIN)[-1]
+
+    await feed(button(30, ADMIN, "st:numdel:users"))
+    await feed(msg(31, ADMIN, "/stats"))
+    assert "Пользователей: 4 (" in session.texts(ADMIN)[-1]
+    await feed(button(32, ADMIN, "st:numclr"))
+    assert await db.get_setting("stats_overrides") is None
+
+    await feed(button(40, 777, "st:num:users"))           # не-админ не может
+    await feed(msg(41, 777, "999"))
+    assert await db.get_setting("stats_overrides") is None
+
+
+def test_find_link():
+    assert find_link("смотри https://vm.tiktok.com/ZMabc123/ !") == "https://vm.tiktok.com/ZMabc123/"
+    assert find_link("https://www.tiktok.com/@user/video/7300000000000000000?lang=ru").endswith("?lang=ru")
+    assert find_link("https://youtube.com/watch?v=1") is None and find_link(None) is None
+
+
+async def test_tiktok_download(env):
+    feed, session, db, dl = env["feed"], env["session"], env["db"], env["downloader"]
+    await feed(msg(1, 501, "/start"))
+    assert "TikTok" in session.texts(501)[-1]
+    assert not any("статистик" in t.lower() for t in session.texts(501))   # про статистику ни слова
+
+    await feed(msg(2, 501, "вот https://vm.tiktok.com/ZMabc123/"))
+    videos = [c for c in session.calls if isinstance(c, SendVideo)]
+    assert dl.urls == ["https://vm.tiktok.com/ZMabc123/"] and len(videos) == 1
+    assert videos[0].chat_id == 501 and videos[0].height == 1280
+    assert not (dl.tmp / "v1").exists()                                   # временный файл удалён
+
+    await feed(msg(3, 501, "https://www.tiktok.com/@a/video/private"))
+    assert any("Не удалось скачать" in e.text for e in session.edits(501))
+
+    await feed(msg(4, 501, "просто текст"))
+    assert len(dl.urls) == 2
+    # пользователь попал в базу и получит рассылку
+    assert (await db.one("SELECT active FROM chats WHERE id=501"))["active"] == 1
