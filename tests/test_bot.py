@@ -11,8 +11,9 @@ from pydantic import TypeAdapter
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.base import BaseSession
-from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
-from aiogram.methods import CopyMessage, EditMessageText, SendMessage, SendVideo, TelegramMethod
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
+from aiogram.methods import (AnswerCallbackQuery, CopyMessage, EditMessageText, GetChatMember, SendMessage,
+                             SendVideo, TelegramMethod)
 from aiogram.types import Update
 
 from bot.broadcast import Broadcaster
@@ -30,6 +31,8 @@ class FakeSession(BaseSession):
         self.calls: list[TelegramMethod] = []
         self.blocked: set[int] = set()
         self.flood_once: set[int] = set()
+        self.subscribers: set[int] = set()
+        self.channel_broken = False
 
     async def make_request(self, bot: Bot, method: TelegramMethod, timeout: int | None = None) -> Any:
         self.calls.append(method)
@@ -40,6 +43,11 @@ class FakeSession(BaseSession):
                 self.flood_once.discard(method.chat_id)
                 raise TelegramRetryAfter(method=method, message="Too Many Requests", retry_after=0)
             raw: Any = {"message_id": 5}
+        elif isinstance(method, GetChatMember):
+            if self.channel_broken:
+                raise TelegramBadRequest(method=method, message="Bad Request: member list is inaccessible")
+            user = {"id": method.user_id, "is_bot": False, "first_name": "U"}
+            raw = {"status": "member" if method.user_id in self.subscribers else "left", "user": user}
         elif isinstance(method, (SendMessage, SendVideo)):
             raw = {"message_id": 1, "date": int(time.time()), "chat": {"id": method.chat_id, "type": "private"},
                    "text": method.text}
@@ -106,8 +114,14 @@ class FakeDownloader:
 
 
 @pytest.fixture
-async def env(tmp_path):
-    cfg = Config(bot_token="1:x", admin_ids=frozenset({ADMIN}), db_path=str(tmp_path / "b.db"), broadcast_rate=0)
+def channels() -> tuple[str, ...]:
+    return ()
+
+
+@pytest.fixture
+async def env(tmp_path, channels):
+    cfg = Config(bot_token="1:x", admin_ids=frozenset({ADMIN}), db_path=str(tmp_path / "b.db"), broadcast_rate=0,
+                 required_channels=channels)
     db = Database(cfg.db_path)
     await db.connect()
     session = FakeSession()
@@ -440,3 +454,40 @@ def test_video_prepared_for_telegram(tmp_path, codec):
     assert video.duration == 2 and not src.exists()
     data = open(video.path, "rb").read()
     assert data.index(b"moov") < data.index(b"mdat")                   # индекс в начале файла
+
+
+def test_parse_channels():
+    from bot.config import parse_channels
+    assert parse_channels("@TripleGifts") == ("@TripleGifts",)
+    assert parse_channels("a, @b -100123") == ("@a", "@b", "-100123") and parse_channels("") == ()
+
+
+@pytest.mark.parametrize("channels", [("@TripleGifts",)])
+async def test_required_subscription(env):
+    feed, session, dl = env["feed"], env["session"], env["downloader"]
+    await feed(msg(1, 501, "/start"))
+    assert "подпишитесь на канал @TripleGifts" in session.texts(501)[-1]
+    kb = [c for c in session.calls if isinstance(c, SendMessage)][-1].reply_markup.inline_keyboard
+    assert kb[0][0].url == "https://t.me/TripleGifts" and kb[1][0].callback_data == "sub:check"
+
+    await feed(msg(2, 501, "https://vm.tiktok.com/ZMabc123/"))
+    assert dl.urls == [] and "@TripleGifts" in session.texts(501)[-1]      # без подписки не качаем
+
+    await feed(button(3, 501, "sub:check"))                                 # нажал, но не подписался
+    answer = [c for c in session.calls if isinstance(c, AnswerCallbackQuery)][-1]
+    assert answer.show_alert and "@TripleGifts" in answer.text and dl.urls == []
+
+    session.subscribers.add(501)
+    await feed(button(4, 501, "sub:check"))                                 # подписался -> ссылка скачана
+    assert dl.urls == ["https://vm.tiktok.com/ZMabc123/"]
+    assert [c for c in session.calls if isinstance(c, SendVideo)][-1].chat_id == 501
+
+    await feed(msg(5, 501, "https://vm.tiktok.com/ZMnext/"))                # дальше — сразу
+    assert dl.urls[-1] == "https://vm.tiktok.com/ZMnext/"
+
+    await feed(msg(6, ADMIN, "https://vm.tiktok.com/ZMadmin/"))             # админу подписка не нужна
+    assert dl.urls[-1] == "https://vm.tiktok.com/ZMadmin/"
+
+    session.channel_broken = True                                           # бот не админ канала —
+    await feed(msg(7, 502, "https://vm.tiktok.com/ZMother/"))               # пользователей не блокируем
+    assert dl.urls[-1] == "https://vm.tiktok.com/ZMother/"
