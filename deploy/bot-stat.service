@@ -1,0 +1,14 @@
+[Unit]
+Description=bot-stat Telegram bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=/opt/bot-stat
+ExecStart=/opt/bot-stat/.venv/bin/python -m bot.main
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
