@@ -29,6 +29,7 @@ async def main() -> None:
                 BotCommand(command="admin", description="Админ-панель"),
                 BotCommand(command="broadcast", description="Рассылка"),
                 BotCommand(command="stats", description="Статистика"),
+                BotCommand(command="stats_settings", description="Настройка статистики"),
                 BotCommand(command="stop", description="Остановить рассылку"),
             ], scope=BotCommandScopeChat(chat_id=admin_id))
         except Exception:

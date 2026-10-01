@@ -1,6 +1,7 @@
 """SQLite: все чаты бота (личные, группы, каналы) и история рассылок."""
 from __future__ import annotations
 
+import json
 import os
 import time
 from typing import Any
@@ -27,6 +28,10 @@ CREATE TABLE IF NOT EXISTS broadcasts (
     sent        INTEGER NOT NULL DEFAULT 0,
     failed      INTEGER NOT NULL DEFAULT 0,
     status      TEXT NOT NULL DEFAULT 'running'   -- running / done / stopped
+);
+CREATE TABLE IF NOT EXISTS settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL                        -- JSON
 );
 """
 
@@ -92,15 +97,21 @@ class Database:
         return [r["id"] for r in await self.all("SELECT id FROM chats WHERE active=1 ORDER BY id")]
 
     async def stats(self) -> dict:
-        now = time.time()
-        row = await self.one(
+        return await self.one(
             "SELECT COUNT(*) total, COALESCE(SUM(active),0) active, "
             "COALESCE(SUM(type='private'),0) users, COALESCE(SUM(type='private' AND active=1),0) users_active, "
-            "COALESCE(SUM(type!='private'),0) groups, COALESCE(SUM(type!='private' AND active=1),0) groups_active, "
-            "COALESCE(SUM(created_at>?),0) day, COALESCE(SUM(created_at>?),0) week, "
-            "COALESCE(SUM(last_seen>?),0) seen_day FROM chats",
-            now - 86400, now - 7 * 86400, now - 86400)
-        return row
+            "COALESCE(SUM(type!='private'),0) groups, COALESCE(SUM(type!='private' AND active=1),0) groups_active "
+            "FROM chats")
+
+    async def counts_since(self, days: int) -> dict:
+        """Сколько чатов появилось и сколько писали боту за последние days дней."""
+        since = time.time() - days * 86400
+        return await self.one("SELECT COALESCE(SUM(created_at>?),0) new, COALESCE(SUM(last_seen>?),0) seen "
+                              "FROM chats", since, since)
+
+    async def by_type(self) -> list[dict]:
+        return await self.all("SELECT type, COUNT(*) n, COALESCE(SUM(active),0) active FROM chats "
+                              "GROUP BY type ORDER BY n DESC")
 
     async def top_sources(self, limit: int = 10) -> list[dict]:
         return await self.all(
@@ -122,3 +133,19 @@ class Database:
 
     async def last_broadcasts(self, limit: int = 5) -> list[dict]:
         return await self.all("SELECT * FROM broadcasts ORDER BY id DESC LIMIT ?", limit)
+
+    # ---------- настройки ----------
+
+    async def get_setting(self, key: str, default: Any = None) -> Any:
+        row = await self.one("SELECT value FROM settings WHERE key=?", key)
+        return json.loads(row["value"]) if row else default
+
+    async def set_setting(self, key: str, value: Any) -> None:
+        await self.conn.execute("INSERT INTO settings(key, value) VALUES (?,?) "
+                                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                                (key, json.dumps(value, ensure_ascii=False)))
+        await self.conn.commit()
+
+    async def delete_setting(self, key: str) -> None:
+        await self.conn.execute("DELETE FROM settings WHERE key=?", (key,))
+        await self.conn.commit()

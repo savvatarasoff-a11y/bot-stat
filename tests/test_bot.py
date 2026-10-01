@@ -11,7 +11,7 @@ from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.base import BaseSession
 from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
-from aiogram.methods import CopyMessage, SendMessage, TelegramMethod
+from aiogram.methods import CopyMessage, EditMessageText, SendMessage, TelegramMethod
 from aiogram.types import Update
 
 from bot.broadcast import Broadcaster
@@ -54,6 +54,9 @@ class FakeSession(BaseSession):
     def texts(self, chat_id: int) -> list[str]:
         return [c.text for c in self.calls if isinstance(c, SendMessage) and c.chat_id == chat_id]
 
+    def edits(self, chat_id: int) -> list[EditMessageText]:
+        return [c for c in self.calls if isinstance(c, EditMessageText) and c.chat_id == chat_id]
+
     def copies(self) -> list[int]:
         return [c.chat_id for c in self.calls if isinstance(c, CopyMessage)]
 
@@ -66,6 +69,13 @@ def msg(uid: int, chat_id: int, text: str, chat_type: str = "private", from_id: 
     if text.startswith("/"):
         m["entities"] = [{"type": "bot_command", "offset": 0, "length": len(text.split()[0])}]
     return {"update_id": uid, "message": m}
+
+
+def button(uid: int, user_id: int, data: str) -> dict:
+    message = {"message_id": 1, "date": int(time.time()), "chat": {"id": user_id, "type": "private"}, "text": "x"}
+    return {"update_id": uid, "callback_query": {
+        "id": str(uid), "chat_instance": "1", "data": data, "message": message,
+        "from": {"id": user_id, "is_bot": False, "first_name": "U"}}}
 
 
 def member(uid: int, chat_id: int, chat_type: str, status: str) -> dict:
@@ -171,3 +181,53 @@ async def test_cancel_and_stop(env):
     await wait_done(bc)
     assert "Рассылка остановлена" in session.texts(ADMIN)[-1]
     assert len(session.copies()) < 51
+
+
+async def test_admin_configures_stats(env):
+    feed, session, db = env["feed"], env["session"], env["db"]
+    for i, uid in enumerate((301, 302), start=1):
+        await feed(msg(i, uid, f"/start ref{uid}"))
+    await feed(member(5, -100500, "supergroup", "member"))
+
+    await feed(msg(10, ADMIN, "/stats_settings"))
+    assert "Настройка статистики" in session.texts(ADMIN)[-1]
+    await feed(button(11, ADMIN, "st:sec:users"))        # выключить пользователей
+    await feed(button(12, ADMIN, "st:sec:types"))        # включить разбивку по типам
+    await feed(button(13, ADMIN, "st:per:30"))           # добавить период «месяц»
+    await feed(button(14, ADMIN, "st:src"))              # 5 -> 10 источников
+    kb = session.edits(ADMIN)[-1].reply_markup.inline_keyboard
+    labels = [b.text for row in kb for b in row]
+    assert "▫️ 👤 Пользователи" in labels and "✅ 🧩 По типам чатов" in labels
+    assert "✅ за месяц" in labels and "🔗 Источников: 10" in labels
+
+    await feed(button(15, ADMIN, "st:title"))
+    await feed(msg(16, ADMIN, "Мой <отчёт>"))
+    assert "Мой &lt;отчёт&gt;" in session.texts(ADMIN)[-1]
+
+    await feed(msg(20, ADMIN, "/stats"))
+    stats = session.texts(ADMIN)[-1]
+    assert stats.startswith("<b>Мой &lt;отчёт&gt;</b>")
+    assert "Пользователей" not in stats
+    assert "личные: 3 (активны: 3)" in stats and "супергруппы: 1 (активны: 1)" in stats
+    assert "Новых за сутки: 4, за неделю: 4, за месяц: 4" in stats
+    assert "<code>ref301</code> — 1" in stats
+
+    # настройки в базе переживают перезапуск; сброс возвращает умолчания
+    assert (await db.get_setting("stats"))["sources_limit"] == 10
+    await feed(button(21, ADMIN, "st:reset"))
+    await feed(msg(22, ADMIN, "/stats"))
+    stats = session.texts(ADMIN)[-1]
+    assert "Пользователей: 3" in stats and "за месяц" not in stats and "Статистика бота" in stats
+
+    # не-админ не может менять настройки
+    await feed(button(30, 777, "st:sec:users"))
+    assert "users" in (await db.get_setting("stats"))["sections"]
+
+
+async def test_title_input_can_be_cancelled(env):
+    feed, session, db = env["feed"], env["session"], env["db"]
+    await feed(button(1, ADMIN, "st:title"))
+    await feed(msg(2, ADMIN, "/cancel"))
+    assert session.texts(ADMIN)[-1] == "Отменено."
+    await feed(msg(3, ADMIN, "просто текст"))
+    assert await db.get_setting("stats") is None
