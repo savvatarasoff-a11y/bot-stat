@@ -27,6 +27,7 @@ CREATE TABLE IF NOT EXISTS broadcasts (
     finished_at REAL,
     sent        INTEGER NOT NULL DEFAULT 0,
     failed      INTEGER NOT NULL DEFAULT 0,
+    queued      INTEGER NOT NULL DEFAULT 0,          -- сколько чатов было в очереди
     status      TEXT NOT NULL DEFAULT 'running'   -- running / done / stopped
 );
 CREATE TABLE IF NOT EXISTS settings (
@@ -48,6 +49,9 @@ class Database:
         self._conn.row_factory = aiosqlite.Row
         await self._conn.execute("PRAGMA journal_mode=WAL")
         await self._conn.executescript(SCHEMA)
+        columns = {r["name"] for r in await self.all("PRAGMA table_info(broadcasts)")}
+        if "queued" not in columns:          # база от старой версии
+            await self._conn.execute("ALTER TABLE broadcasts ADD COLUMN queued INTEGER NOT NULL DEFAULT 0")
         # рассылки, оборванные перезапуском, больше не «идут»
         await self._conn.execute("UPDATE broadcasts SET status='stopped' WHERE status='running'")
         await self._conn.commit()
@@ -126,9 +130,10 @@ class Database:
         await self.conn.commit()
         return cur.lastrowid
 
-    async def broadcast_end(self, bc_id: int, sent: int, failed: int, status: str) -> None:
-        await self.conn.execute("UPDATE broadcasts SET finished_at=?, sent=?, failed=?, status=? WHERE id=?",
-                                (time.time(), sent, failed, status, bc_id))
+    async def broadcast_end(self, bc_id: int, sent: int, failed: int, status: str, queued: int = 0) -> None:
+        await self.conn.execute(
+            "UPDATE broadcasts SET finished_at=?, sent=?, failed=?, queued=?, status=? WHERE id=?",
+            (time.time(), sent, failed, queued, status, bc_id))
         await self.conn.commit()
 
     async def last_broadcasts(self, limit: int = 5) -> list[dict]:

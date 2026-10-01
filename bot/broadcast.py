@@ -109,7 +109,7 @@ class Broadcaster:
                 log.exception("Рассылка #%s прервана ошибкой", bc_id)
                 status = "error"
             res = self.result
-            await self.db.broadcast_end(bc_id, res.sent, res.failed, status)
+            await self.db.broadcast_end(bc_id, res.sent, res.failed, status, res.queued)
             log.info("Рассылка #%s: доставлено %s, не доставлено %s", bc_id, res.sent, res.failed)
             if done:
                 try:

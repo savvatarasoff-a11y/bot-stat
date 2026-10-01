@@ -17,7 +17,7 @@ from .config import Config
 from .db import Database
 from .stats import (ALL_METRICS, HISTORY_LIMITS, PERIODS, REPORT_LINES, SECTIONS, SOURCES_LIMITS, TITLE_MAX,
                     StatsSettings, describe_rule, load_overrides, load_settings, next_value, numbers_keyboard,
-                    numbers_text, parse_rule, report_settings_keyboard, report_settings_text, report_text,
+                    numbers_text, parse_rule, progress_text, report_settings_keyboard, report_settings_text, report_text,
                     save_overrides, save_settings, settings_keyboard, settings_text, stats_keyboard, stats_text)
 from .tiktok import DownloadError, TikTokDownloader, find_link
 
@@ -67,9 +67,8 @@ def build_router(cfg: Config, db: Database, broadcaster: Broadcaster,
 
     async def ask_broadcast(message: Message, state: FSMContext) -> None:
         if broadcaster.running:
-            r = broadcaster.result
-            await message.answer(f"⏳ Рассылка уже идёт: {r.total if r else 0} из {r.queued if r else 0}.\n"
-                                 "Остановить: /stop")
+            progress = await progress_text(db, broadcaster.result or Result())
+            await message.answer(f"⏳ Рассылка уже идёт. {progress}\nОстановить: /stop")
             return
         await state.set_state(BroadcastForm.message)
         await message.answer("✉️ Введите текст для рассылки:")
@@ -225,7 +224,7 @@ def build_router(cfg: Config, db: Database, broadcaster: Broadcaster,
         await message.answer(f"⏳ Начинаю {kind}рассылку... Это может занять некоторое время.")
 
         async def progress(res: Result) -> None:
-            await bot.send_message(chat_id, f"📨 Обработано {res.total} из {res.queued}, доставлено {res.sent}")
+            await bot.send_message(chat_id, await progress_text(db, res))
 
         async def done(res: Result, stopped: bool) -> None:
             await bot.send_message(chat_id, await report_text(db, broadcaster, res, stopped))

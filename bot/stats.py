@@ -178,9 +178,33 @@ async def shown_numbers(db: Database) -> dict[str, int]:
     return {k: apply_rule(v, overrides.get(k)) for k, v in (await real_numbers(db)).items()}
 
 
-def shown_delivery(sent: int, failed: int, overrides: dict[str, str]) -> tuple[int, int]:
-    """Доставлено / не доставлено с учётом правок админа."""
-    return apply_rule(sent, overrides.get("bc_sent")), apply_rule(failed, overrides.get("bc_failed"))
+def shown_delivery(sent: int, failed: int, queued: int, overrides: dict[str, str]) -> tuple[int, int, int]:
+    """Доставлено / не доставлено / в очереди с учётом правок админа.
+
+    Если поправлено «Получат рассылку», рассылка выглядит так, будто шла на столько чатов:
+    доставленные и недоставленные растут в той же пропорции, а если одна из них задана
+    поправкой «Доставлено / Не доставлено в рассылке», вторая — остаток до этого числа."""
+    rule_sent, rule_failed = overrides.get("bc_sent"), overrides.get("bc_failed")
+    target = apply_rule(queued, overrides.get("active")) if queued else 0
+    if not queued or target == queued:
+        return apply_rule(sent, rule_sent), apply_rule(failed, rule_failed), queued
+    processed = round((sent + failed) * target / queued)
+    sent = round(sent * target / queued)
+    failed = processed - sent
+    if rule_failed and not rule_sent:
+        failed = min(apply_rule(failed, rule_failed), processed)
+        sent = processed - failed
+    elif rule_sent and not rule_failed:
+        sent = min(apply_rule(sent, rule_sent), processed)
+        failed = processed - sent
+    else:
+        sent, failed = apply_rule(sent, rule_sent), apply_rule(failed, rule_failed)
+    return sent, failed, target
+
+
+async def progress_text(db: Database, res: Result) -> str:
+    sent, failed, queued = shown_delivery(res.sent, res.failed, res.queued, await load_overrides(db))
+    return f"📨 Обработано {sent + failed} из {queued}, доставлено {sent}"
 
 
 def _by_periods(st: dict[str, int], key: str, periods: list[int]) -> str:
@@ -217,12 +241,13 @@ async def stats_text(db: Database, broadcaster: Broadcaster, s: StatsSettings | 
             lines.append("\n📨 <b>Последние рассылки:</b>")
             for b in history:
                 when = time.strftime("%d.%m %H:%M", time.localtime(b["started_at"]))
-                sent, failed = shown_delivery(b["sent"], b["failed"], overrides)
+                sent, failed, _ = shown_delivery(b["sent"], b["failed"], b.get("queued") or 0, overrides)
                 lines.append(f"{when} — доставлено {sent}, не доставлено {failed} "
                              f"({STATUS_NAMES.get(b['status'], b['status'])})")
     if "running" in on and broadcaster.running and broadcaster.result:
         r = broadcaster.result
-        lines.append(f"\n⏳ Сейчас идёт рассылка: {r.total} из {r.queued}")
+        sent, failed, queued = shown_delivery(r.sent, r.failed, r.queued, overrides)
+        lines.append(f"\n⏳ Сейчас идёт рассылка: {sent + failed} из {queued}")
     if len(lines) == 1:
         lines.append("Все блоки выключены. Включите нужные в «⚙️ Настроить».")
     return "\n".join(lines)
@@ -233,7 +258,7 @@ async def report_text(db: Database, broadcaster: Broadcaster, res: Result, stopp
     """Отчёт после рассылки по настройкам админа (строки и правки цифр те же, что в /stats)."""
     s = s or await load_settings(db)
     on = set(s.report)
-    sent, failed = shown_delivery(res.sent, res.failed, await load_overrides(db))
+    sent, failed, _ = shown_delivery(res.sent, res.failed, res.queued, await load_overrides(db))
     lines = ["⛔️ <b>Рассылка остановлена</b>" if stopped else "✅ <b>Рассылка завершена!</b>"]
     body = []
     if "sent" in on:
@@ -326,7 +351,8 @@ async def numbers_text(db: Database) -> str:
         if rule:
             line += f" (реально {real[k]}, {describe_rule(rule)})"
         lines.append(line)
-    lines.append("\n📨 <b>После рассылки</b> (поправка к каждому отчёту и к «Последним рассылкам»):")
+    lines.append("\n📨 <b>После рассылки</b>: отчёт, прогресс и «Последние рассылки» считаются от "
+                 "«Получат рассылку», а эти поправки добавляются сверху:")
     for k, name in REPORT_METRICS.items():
         rule = overrides.get(k)
         lines.append(f"{name}: {describe_rule(rule) if rule else 'реальное значение'}")
