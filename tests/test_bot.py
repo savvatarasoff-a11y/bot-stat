@@ -341,6 +341,45 @@ async def test_report_arrives_when_broadcast_breaks(env):
     assert (await db.one("SELECT status FROM broadcasts"))["status"] == "error"
 
 
+async def test_report_follows_reach_override(env):
+    feed, session, db, bc = env["feed"], env["session"], env["db"], env["broadcaster"]
+    for i, uid in enumerate((301, 302, 303, 304), start=1):
+        await feed(msg(i, uid, "/start"))
+    session.blocked = {302}
+
+    await feed(button(10, ADMIN, "st:num:active"))        # «Получат рассылку» = 15000
+    await feed(msg(11, ADMIN, "15000"))
+    await feed(msg(20, ADMIN, "/broadcast"))
+    await feed(msg(21, ADMIN, "привет"))
+    await wait_done(bc)
+    # реально 5 чатов (4 + админ), 1 не доставлено -> 15000, из них 1/5 не доставлено
+    report = session.texts(ADMIN)[-1]
+    assert "Успешно доставлено: 12000 пользователям" in report
+    assert "Не доставлено: 3000 пользователям" in report
+    assert "Всего обработано: 15000 пользователей" in report
+
+    await feed(msg(30, ADMIN, "/stats"))
+    stats = session.texts(ADMIN)[-1]
+    assert "Всего получат рассылку: 15000" in stats and "доставлено 12000, не доставлено 3000" in stats
+    assert (await db.one("SELECT sent, failed, queued FROM broadcasts")) == {"sent": 4, "failed": 1, "queued": 5}
+
+
+async def test_old_database_gets_queued_column(tmp_path):
+    import sqlite3
+    path = str(tmp_path / "old.db")
+    con = sqlite3.connect(path)
+    con.execute("CREATE TABLE broadcasts (id INTEGER PRIMARY KEY AUTOINCREMENT, admin_id INTEGER NOT NULL, "
+                "started_at REAL NOT NULL, finished_at REAL, sent INTEGER NOT NULL DEFAULT 0, "
+                "failed INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'running')")
+    con.execute("INSERT INTO broadcasts(admin_id, started_at, sent, failed, status) VALUES (1, 0, 7, 2, 'done')")
+    con.commit()
+    con.close()
+    db = Database(path)
+    await db.connect()
+    assert (await db.last_broadcasts(1))[0]["queued"] == 0
+    await db.close()
+
+
 def test_find_link():
     assert find_link("смотри https://vm.tiktok.com/ZMabc123/ !") == "https://vm.tiktok.com/ZMabc123/"
     assert find_link("https://www.tiktok.com/@user/video/7300000000000000000?lang=ru").endswith("?lang=ru")
