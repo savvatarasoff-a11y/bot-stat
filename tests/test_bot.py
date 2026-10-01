@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import shutil
 import time
 from typing import Any
 
@@ -18,7 +19,7 @@ from bot.broadcast import Broadcaster
 from bot.config import Config
 from bot.db import Database
 from bot.handlers import build_router
-from bot.tiktok import DownloadError, Video, find_link
+from bot.tiktok import DownloadError, Video, find_link, prepare, probe
 
 ADMIN = 5349009098
 
@@ -418,3 +419,24 @@ async def test_tiktok_download(env):
     assert len(dl.urls) == 2
     # пользователь попал в базу и получит рассылку
     assert (await db.one("SELECT active FROM chats WHERE id=501"))["active"] == 1
+
+
+def _ffmpeg_clip(path, codec: str) -> None:
+    import subprocess
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=360x640:rate=30:duration=2",
+                    "-f", "lavfi", "-i", "sine=duration=2", "-c:v", codec, "-c:a", "aac", "-shortest", str(path)],
+                   check=True)
+
+
+@pytest.mark.skipif(not shutil.which("ffmpeg"), reason="нет ffmpeg")
+@pytest.mark.parametrize("codec", ["libx265", "libx264"])
+def test_video_prepared_for_telegram(tmp_path, codec):
+    src = tmp_path / "video.mp4"
+    _ffmpeg_clip(src, codec)
+    video = prepare(Video(path=str(src), title="t"))
+    meta = probe(video.path)
+    assert meta["codec"] == "h264" and meta["pix_fmt"] == "yuv420p"     # H.265 перекодирован
+    assert (meta["width"], meta["height"], video.width, video.height) == (360, 640, 360, 640)
+    assert video.duration == 2 and not src.exists()
+    data = open(video.path, "rb").read()
+    assert data.index(b"moov") < data.index(b"mdat")                   # индекс в начале файла

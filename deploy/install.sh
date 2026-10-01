@@ -9,7 +9,7 @@ DIR=/opt/bot-stat
 TOKEN="${1:-}"
 
 apt-get update -qq
-apt-get install -y -qq git python3 python3-venv >/dev/null
+apt-get install -y -qq git python3 python3-venv ffmpeg >/dev/null   # ffmpeg: видео в H.264 без лагов
 
 if [ -d "$DIR/.git" ]; then
     git -C "$DIR" pull --ff-only
