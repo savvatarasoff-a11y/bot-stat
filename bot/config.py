@@ -5,6 +5,7 @@ import os
 from dataclasses import dataclass
 
 DEFAULT_ADMIN_IDS = "5349009098"
+DEFAULT_REQUIRED_CHANNELS = "@TripleGifts"
 
 
 def load_dotenv(path: str = ".env") -> None:
@@ -19,12 +20,19 @@ def load_dotenv(path: str = ".env") -> None:
             os.environ.setdefault(key.strip(), value.split(" #")[0].strip())
 
 
+def parse_channels(raw: str) -> tuple[str, ...]:
+    """"@a, b, -100123" -> ("@a", "@b", "-100123"); пустая строка — подписка не нужна."""
+    names = (x.strip() for x in raw.replace(" ", ",").split(","))
+    return tuple(n if n.startswith("@") or n.lstrip("-").isdigit() else f"@{n}" for n in names if n)
+
+
 @dataclass(frozen=True)
 class Config:
     bot_token: str
     admin_ids: frozenset[int]
     db_path: str = "data/bot.db"
     broadcast_rate: float = 25
+    required_channels: tuple[str, ...] = ()      # обязательная подписка перед скачиванием
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -38,4 +46,5 @@ class Config:
             admin_ids=frozenset(int(x) for x in ids.replace(" ", "").split(",") if x),
             db_path=os.environ.get("DB_PATH", "data/bot.db"),
             broadcast_rate=float(os.environ.get("BROADCAST_RATE", 25)),
+            required_channels=parse_channels(os.environ.get("REQUIRED_CHANNELS", DEFAULT_REQUIRED_CHANNELS)),
         )

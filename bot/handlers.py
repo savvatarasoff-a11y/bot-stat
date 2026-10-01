@@ -19,6 +19,7 @@ from .stats import (ALL_METRICS, HISTORY_LIMITS, PERIODS, REPORT_LINES, SECTIONS
                     StatsSettings, describe_rule, load_overrides, load_settings, next_value, numbers_keyboard,
                     numbers_text, parse_rule, progress_text, report_settings_keyboard, report_settings_text, report_text,
                     save_overrides, save_settings, settings_keyboard, settings_text, stats_keyboard, stats_text)
+from .subscription import missing_channels, subscribe_keyboard, subscribe_text
 from .tiktok import DownloadError, TikTokDownloader, find_link
 
 
@@ -45,7 +46,7 @@ def chat_title(chat) -> str | None:
     return chat.title
 
 
-async def edit(query: CallbackQuery, text: str, markup: InlineKeyboardMarkup) -> None:
+async def edit(query: CallbackQuery, text: str, markup: InlineKeyboardMarkup | None) -> None:
     """Перерисовать сообщение с кнопками; «не изменилось» — не ошибка."""
     try:
         await query.message.edit_text(text, reply_markup=markup)
@@ -272,14 +273,47 @@ def build_router(cfg: Config, db: Database, broadcaster: Broadcaster,
         await db.upsert_chat(chat.id, chat.type, chat_title(chat), chat.username, start_arg)
         return await handler(message, data)
 
+    async def not_subscribed(bot: Bot, user_id: int | None) -> list[str]:
+        if not cfg.required_channels or user_id is None or user_id in cfg.admin_ids:
+            return []
+        return await missing_channels(bot, cfg.required_channels, user_id)
+
     @users.message(CommandStart(), F.chat.type == "private")
-    async def start(message: Message) -> None:
-        await message.answer(f"👋 Привет, {html.escape(message.from_user.first_name)}!\n\n"
-                             "Пришлите ссылку на видео из TikTok, и я скачаю его для вас.")
+    async def start(message: Message, bot: Bot) -> None:
+        text = (f"👋 Привет, {html.escape(message.from_user.first_name)}!\n\n"
+                "Пришлите ссылку на видео из TikTok, и я скачаю его для вас.")
+        missing = await not_subscribed(bot, message.from_user.id)
+        if missing:
+            await message.answer(f"{text}\n\n{subscribe_text(missing)}", reply_markup=subscribe_keyboard(missing))
+        else:
+            await message.answer(text)
 
     @users.message(F.text.func(find_link))
-    async def tiktok(message: Message, bot: Bot) -> None:
+    async def tiktok(message: Message, bot: Bot, state: FSMContext) -> None:
         url = find_link(message.text)
+        missing = await not_subscribed(bot, message.from_user.id if message.from_user else None)
+        if missing:
+            await state.update_data(pending_url=url)       # скачаем сразу после подписки
+            await message.reply(subscribe_text(missing), reply_markup=subscribe_keyboard(missing))
+            return
+        await send_video(message, bot, url)
+
+    @users.callback_query(F.data == "sub:check")
+    async def subscription_check(query: CallbackQuery, bot: Bot, state: FSMContext) -> None:
+        missing = await not_subscribed(bot, query.from_user.id)
+        if missing:
+            await query.answer(f"Вы ещё не подписались на {', '.join(missing)}", show_alert=True)
+            return
+        await query.answer("Спасибо за подписку!")
+        url = (await state.get_data()).get("pending_url")
+        await state.update_data(pending_url=None)
+        if url and query.message:
+            await edit(query, "✅ Подписка есть, скачиваю видео.", None)
+            await send_video(query.message, bot, url)
+        else:
+            await edit(query, "✅ Подписка есть! Пришлите ссылку на видео из TikTok.", None)
+
+    async def send_video(message: Message, bot: Bot, url: str) -> None:
         wait = await message.reply("⏳ Скачиваю видео...")
         await bot.send_chat_action(message.chat.id, "upload_video")
         try:
