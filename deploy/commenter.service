@@ -1,0 +1,14 @@
+[Unit]
+Description=bot-stat commenter (Telethon userbot)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=/opt/bot-stat
+ExecStart=/opt/bot-stat/.venv/bin/python -m commenter
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

@@ -1,3 +1,4 @@
 -r requirements.txt
+-r requirements-commenter.txt
 pytest>=8
 pytest-asyncio>=0.23

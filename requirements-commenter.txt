@@ -1,0 +1,2 @@
+telethon>=1.40,<2
+cryptg>=0.4   # быстрое шифрование MTProto на C
