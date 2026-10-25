@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
-DEFAULT_ADMIN_IDS = "5349009098"
+DEFAULT_ADMIN_IDS = "8792045653"
 DEFAULT_REQUIRED_CHANNELS = "@TripleGifts"
 
 
